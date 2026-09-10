@@ -1,0 +1,16 @@
+MASTER PLAN AI ASSISTANT — RENDER DEPLOYMENT
+
+1) Upload ALL files in this folder to your GitHub repository.
+2) Go to https://render.com and sign in with GitHub.
+3) Click New +  > Blueprint.
+4) Select the GitHub repository containing these files.
+5) Render will detect render.yaml automatically.
+6) When asked for OPENAI_API_KEY, paste your key. If you only want demo mode, you may leave it unset and the built-in demo knowledge base will still work.
+7) Click Deploy Blueprint / Apply.
+8) Wait for the status to become Live, then open the generated onrender.com URL.
+
+Manual Web Service fallback (if you do not use Blueprint):
+Build Command: pip install -r requirements.txt
+Start Command: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT
+
+Important: Never put your API key inside app.py or commit it to GitHub.
