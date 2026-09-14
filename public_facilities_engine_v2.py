@@ -230,9 +230,13 @@ def review_public_facilities(
             continue
 
         standard = rule.get("population_standard")
-        # Same strict threshold rule for the individual facility.
-        if isinstance(standard, (int, float)) and population <= standard:
-            continue
+        # IMPORTANT BUSINESS RULE:
+        # Population standards are used to determine WHEN A SERVICE LEVEL becomes active,
+        # not to hide individual services inside an already-active level.
+        # Once the project activates a level (e.g. the residential district level),
+        # ALL mandatory services listed under that level are included, even when an
+        # individual row shows a higher population standard. The row standard remains
+        # visible as a reference/capacity value only.
 
         land = _eval_land_formula(rule, population)
         gfa = _eval_gfa_formula(rule, land)
@@ -336,8 +340,8 @@ def build_customer_reply(result: dict[str, Any]) -> str:
 
     lines.extend([
         "",
-        "ملاحظة: لا يتم احتساب خدمات المستويات الأعلى من المستوى السكاني المنطبق على المشروع. "
-        "كما أن الخدمات المعلّمة في المرجع بأنها غير مطلوبة ضمن المشاريع التطويرية لا يتم طلبها من المتعامل."
+        "ملاحظة: بمجرد تفعيل مستوى خدمي، يتم إدراج جميع خدماته الإلزامية، ولا يتم استخدام معيار السكان الخاص بكل صف لاستبعاد خدمة داخل المستوى المفعّل. "
+        "ولا يتم احتساب خدمات المستويات الأعلى من المستوى السكاني المنطبق على المشروع. كما أن الخدمات المعلّمة في المرجع بأنها غير مطلوبة ضمن المشاريع التطويرية لا يتم طلبها من المتعامل."
     ])
     return "\n".join(lines)
 
@@ -352,7 +356,7 @@ def result_rows(result: dict[str, Any], include_optional: bool = True) -> list[d
         "مستوى الخدمة": x["level"],
         "الخدمة": x["service"],
         "الحالة": x["note_type"],
-        "معيار السكان/مرفق": x["population_standard"],
+        "معيار السكان المرجعي": x["population_standard"],
         "عدد المرافق": x["facility_count"],
         "مساحة الأرض المطلوبة (م²)": x["required_land_area_m2"],
         "GFA (م²)": x["required_gfa_m2"],

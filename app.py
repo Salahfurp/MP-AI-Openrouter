@@ -8,12 +8,18 @@ import streamlit as st
 from rank_bm25 import BM25Okapi
 
 from public_facilities_chat import new_flow_state, process_public_facilities_turn
+from public_facilities_comparison import (
+    SubmittedFacility, compare_facilities, comparison_rows, parse_csv_or_text_table,
+    parse_excel_bytes, parse_pdf_bytes,
+)
+from public_facilities_report import build_comparison_pdf
 
 APP_DIR = Path(__file__).parent
 TEXT_PATH = APP_DIR / "guide_pages.txt"
 MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 PF_STATE_KEY = "public_facilities_flow"
+PF_COMPARE_KEYWORDS = ("قارن", "مقارنة", "راجع الخدمات", "راجع الجدول", "العجز", "deficit", "compare", "review facilities")
 
 st.set_page_config(page_title="Master Plan AI Assistant", page_icon="🏙️", layout="wide")
 
@@ -255,7 +261,7 @@ def render_public_facilities_table(rows):
         "مستوى الخدمة",
         "الخدمة",
         "الحالة",
-        "معيار السكان/مرفق",
+        "معيار السكان المرجعي",
         "عدد المرافق",
         "مساحة الأرض المطلوبة (م²)",
         "GFA (م²)",
@@ -278,6 +284,17 @@ def render_message(m):
                     ex_df = pd.DataFrame(excluded)
                     cols = [c for c in ["level", "service", "note_type"] if c in ex_df.columns]
                     st.dataframe(ex_df[cols], use_container_width=True, hide_index=True)
+        elif m.get("kind") == "facilities_comparison":
+            render_comparison_table(m.get("comparison_rows") or [])
+            if m.get("pdf_bytes"):
+                st.download_button(
+                    "📄 تنزيل تقرير المقارنة PDF",
+                    data=m["pdf_bytes"],
+                    file_name=m.get("pdf_name", "Public_Facilities_Compliance_Report.pdf"),
+                    mime="application/pdf",
+                    key=f"pdf_{id(m)}",
+                    use_container_width=True,
+                )
 
 
 def handle_public_facilities_turn(question):
@@ -299,6 +316,127 @@ def handle_public_facilities_turn(question):
         "result": payload.get("result"),
     }
 
+
+
+# -----------------------------
+# Public Facilities comparison / compliance review
+# -----------------------------
+def detect_facilities_comparison_intent(text):
+    t = (text or "").lower()
+    return any(k in t for k in PF_COMPARE_KEYWORDS)
+
+
+def ai_parse_pdf_facilities(extracted_text):
+    """Strict structure extraction only; comparison/calculation remains deterministic."""
+    state = st.session_state.get(PF_STATE_KEY) or {}
+    last = state.get("last_result") or {}
+    known = [x.get("service") for x in (last.get("required") or []) + (last.get("optional") or []) if x.get("service")]
+    known_text = "\n".join(f"- {x}" for x in known)
+    prompt = f"""You are extracting a submitted public-facilities schedule from PDF text.
+Return ONLY a JSON array. Do not add markdown or explanation.
+Each object must use these keys exactly:
+service, count, land_area_m2, gfa_m2, level
+Rules:
+- Extract only values explicitly present in the PDF text. Never invent missing values.
+- Use null when count/land/GFA/level is not shown.
+- Keep the service name as written, but when clearly equivalent prefer the closest known official service name below.
+- Ignore headers, footers, totals and unrelated planning text.
+
+Known service names for this project:
+{known_text}
+
+PDF text:
+{extracted_text[:18000]}
+"""
+    raw = openrouter_chat([{"role": "user", "content": prompt}], max_tokens=2200, temperature=0)
+    cleaned = raw.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    import json
+    data = json.loads(cleaned)
+    return data if isinstance(data, list) else []
+
+
+def parse_uploaded_facilities(uploaded_file):
+    if uploaded_file is None:
+        return [], None
+    name = uploaded_file.name.lower()
+    data = uploaded_file.getvalue()
+    if name.endswith((".xlsx", ".xls")):
+        return parse_excel_bytes(data, uploaded_file.name), None
+    if name.endswith(".csv"):
+        return parse_csv_or_text_table(data.decode("utf-8", errors="ignore")), None
+    if name.endswith(".txt"):
+        return parse_csv_or_text_table(data.decode("utf-8", errors="ignore")), None
+    if name.endswith(".pdf"):
+        rows, extracted = parse_pdf_bytes(data, ai_json_parser=ai_parse_pdf_facilities)
+        return rows, extracted
+    raise ValueError("صيغة الملف غير مدعومة. استخدم Excel أو CSV أو TXT أو PDF.")
+
+
+def build_comparison_chat_event(submitted_rows, source_label="الجدول المقدم"):
+    state = st.session_state.get(PF_STATE_KEY) or {}
+    required_result = state.get("last_result")
+    if not required_result:
+        return {
+            "role": "assistant",
+            "content": "قبل مراجعة جدول الخدمات، أحتاج أولًا حساب المتطلبات للمشروع. اطلب **حساب الخدمات العامة** وأدخل مساحة الأرض وعدد السكان، ثم أعد إرسال الجدول للمقارنة.",
+            "kind": "text",
+        }
+    if not submitted_rows:
+        return {
+            "role": "assistant",
+            "content": "لم أستطع العثور على صفوف خدمات قابلة للمقارنة في البيانات المقدمة. تأكد أن الجدول يحتوي على الأقل على **اسم الخدمة** ويفضل **العدد**، ويمكن أيضًا إضافة **مساحة الأرض** و **GFA**.",
+            "kind": "text",
+        }
+
+    report = compare_facilities(required_result, submitted_rows)
+    rows = comparison_rows(report)
+    summary = report.get("summary", {})
+    deficits = [x for x in report.get("comparisons", []) if x.get("status") == "عجز"]
+    if deficits:
+        top = "، ".join(x.get("service", "") for x in deficits[:5])
+        more = "" if len(deficits) <= 5 else f" وغيرها ({len(deficits)-5} خدمة إضافية)"
+        message = (
+            f"تمت مراجعة **{source_label}** مقابل الخدمات الإلزامية المحسوبة للمشروع. "
+            f"الاستيفاء **{summary.get('compliance_percent', 0)}%**: "
+            f"**{summary.get('compliant_services', 0)} مستوفاة** و**{summary.get('deficit_services', 0)} بها عجز**.\n\n"
+            f"أبرز الخدمات التي تحتاج استكمال: **{top}{more}**. "
+            "الجدول أدناه يوضح العجز بالتفصيل، ويمكن تنزيل تقرير PDF احترافي بالألوان."
+        )
+    else:
+        message = (
+            f"تمت مراجعة **{source_label}**، وجميع الخدمات الإلزامية الظاهرة في الحساب **مستوفاة حسب البيانات المقدمة**. "
+            f"نسبة الاستيفاء **{summary.get('compliance_percent', 100)}%**."
+        )
+
+    pdf_bytes = build_comparison_pdf(report)
+    return {
+        "role": "assistant",
+        "content": message,
+        "kind": "facilities_comparison",
+        "comparison_rows": rows,
+        "comparison_report": report,
+        "pdf_bytes": pdf_bytes,
+        "pdf_name": "Public_Facilities_Compliance_Report.pdf",
+    }
+
+
+def render_comparison_table(rows):
+    if not rows:
+        return
+    df = pd.DataFrame(rows)
+    def color_status(v):
+        text = str(v)
+        if "عجز" in text:
+            return "background-color: #FEE4E2; color: #B42318; font-weight: 700"
+        if "مستوفى" in text:
+            return "background-color: #D1FADF; color: #027A48; font-weight: 700"
+        return ""
+    try:
+        st.dataframe(df.style.map(color_status, subset=["الحالة"]), use_container_width=True, hide_index=True)
+    except Exception:
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
 # -----------------------------
 # UI
@@ -360,7 +498,25 @@ for col, label, q in quick:
 for m in st.session_state.messages:
     render_message(m)
 
-question = st.chat_input("اسأل عن UPPG أو اطلب حساب الخدمات العامة...")
+with st.expander("📎 مراجعة جدول الخدمات المقدم من المتعامل", expanded=False):
+    st.caption("بعد حساب الخدمات المطلوبة للمشروع، ارفع جدول المتعامل بصيغة Excel / CSV / TXT / PDF، وسيتم مقارنته بالمتطلبات وإظهار العجز وإصدار تقرير PDF.")
+    uploaded_pf = st.file_uploader(
+        "ارفع جدول الخدمات",
+        type=["xlsx", "xls", "csv", "txt", "pdf"],
+        key="pf_submission_upload",
+    )
+    compare_uploaded = st.button("🔍 راجع الجدول واكشف العجز", use_container_width=True)
+
+if compare_uploaded:
+    try:
+        submitted, _ = parse_uploaded_facilities(uploaded_pf)
+        event = build_comparison_chat_event(submitted, source_label=uploaded_pf.name if uploaded_pf else "الملف المقدم")
+    except Exception as e:
+        event = {"role": "assistant", "content": f"تعذر قراءة الملف أو مقارنته: `{e}`", "kind": "text"}
+    st.session_state.messages.append(event)
+    st.rerun()
+
+question = st.chat_input("اسأل عن UPPG، احسب الخدمات، أو الصق جدول الخدمات للمراجعة...")
 if "pending" in st.session_state and not question:
     question = st.session_state.pop("pending")
 
@@ -369,11 +525,26 @@ if question:
     st.session_state.messages.append(user_event)
     render_message(user_event)
 
-    # IMPORTANT: calculator workflow gets the turn first. If not applicable,
-    # the question falls back to the existing UPPG RAG assistant.
-    pf_event = handle_public_facilities_turn(question)
+    # If the user asks for a comparison and pastes a text table, compare it against
+    # the most recent calculator result before falling back to normal Q&A.
+    comparison_event = None
+    if detect_facilities_comparison_intent(question) and ("\n" in question or "|" in question or "\t" in question):
+        submitted = parse_csv_or_text_table(question)
+        if submitted:
+            comparison_event = build_comparison_chat_event(submitted, source_label="الجدول النصي المقدم في المحادثة")
 
-    if pf_event is not None:
+    if comparison_event is not None:
+        render_message(comparison_event)
+        st.session_state.messages.append(comparison_event)
+        pf_event = None
+    else:
+        # IMPORTANT: calculator workflow gets the turn first. If not applicable,
+        # the question falls back to the existing UPPG RAG assistant.
+        pf_event = handle_public_facilities_turn(question)
+
+    if comparison_event is not None:
+        pass
+    elif pf_event is not None:
         render_message(pf_event)
         st.session_state.messages.append(pf_event)
     else:
@@ -405,5 +576,5 @@ st.divider()
 st.caption(
     "Source basis: Urban Planning Permits Guideline (UPPG), 139 pages, plus the Public Facilities Calculator rules "
     "extracted from the supplied Excel workbook. The calculator uses project area and population to determine density, "
-    "the applicable service level, and the required facilities up to that level only."
+    "the applicable service level, and all mandatory facilities up to that level. Submitted service schedules can be compared against the calculated requirements and exported as a PDF review report."
 )
