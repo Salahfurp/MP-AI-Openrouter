@@ -1,0 +1,24 @@
+Master Plan AI Assistant - Google AI setup
+===========================================
+
+The V4 code supports two AI routes:
+1) Google AI directly (recommended)
+2) OpenRouter fallback
+
+To use Google AI on Render, add these Environment Variables:
+
+AI_PROVIDER=google
+GEMINI_API_KEY=YOUR_GOOGLE_AI_STUDIO_KEY
+GOOGLE_MODEL=gemini-3.8-flash
+
+Recommended production model:
+GOOGLE_MODEL=gemini-3.8-flash
+
+Gemma 4 options available through the Gemini API:
+GOOGLE_MODEL=gemma-4-31b-it
+or
+GOOGLE_MODEL=gemma-4-26b-a4b-it
+
+If AI_PROVIDER is left as auto, the app uses Google AI when GEMINI_API_KEY or GOOGLE_API_KEY exists; otherwise it falls back to OpenRouter when OPENROUTER_API_KEY exists.
+
+Your existing OpenRouter variables can remain in Render. They act as fallback when AI_PROVIDER=openrouter or when no Google key is configured.

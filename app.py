@@ -3,23 +3,28 @@ import re
 from pathlib import Path
 
 import pandas as pd
-import requests
 import streamlit as st
 from rank_bm25 import BM25Okapi
+
+from ai_provider import ai_chat, provider_label
 
 from public_facilities_chat import new_flow_state, process_public_facilities_turn
 from public_facilities_comparison import (
     SubmittedFacility, compare_facilities, comparison_rows, parse_csv_or_text_table,
-    parse_excel_bytes, parse_pdf_bytes,
+    parse_excel_bytes, parse_pdf_bytes, looks_like_facilities_table,
 )
 from public_facilities_report import build_comparison_pdf
 
 APP_DIR = Path(__file__).parent
 TEXT_PATH = APP_DIR / "guide_pages.txt"
-MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
-API_URL = "https://openrouter.ai/api/v1/chat/completions"
 PF_STATE_KEY = "public_facilities_flow"
-PF_COMPARE_KEYWORDS = ("قارن", "مقارنة", "راجع الخدمات", "راجع الجدول", "العجز", "deficit", "compare", "review facilities")
+PF_PENDING_SUBMISSION_KEY = "pending_public_facilities_submission"
+PF_COMPARE_KEYWORDS = (
+    "قارن", "مقارنة", "قارنها", "قارنه", "راجع الخدمات", "راجع الجدول", "راجع الملف",
+    "العجز", "ترجم وقارن", "ترجمه واعمل المقارنة", "ترجم الجدول", "حلل الجدول",
+    "deficit", "compare", "compare it", "comparison", "review facilities", "review the table",
+    "check facilities", "compliance", "translate and compare", "translate the table",
+)
 
 st.set_page_config(page_title="Master Plan AI Assistant", page_icon="🏙️", layout="wide")
 
@@ -74,76 +79,9 @@ def tokenize(text):
     return re.findall(r"[A-Za-z0-9%+.-]+|[\u0600-\u06FF]+", text.lower())
 
 
-def openrouter_chat(messages, max_tokens=900, temperature=0.15):
-    key = os.getenv("OPENROUTER_API_KEY")
-    if not key:
-        raise RuntimeError("OPENROUTER_API_KEY is not set in Render Environment Variables.")
-
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": os.getenv("APP_URL", "https://mp-ai-assistant.onrender.com"),
-        "X-Title": "Master Plan AI Assistant",
-    }
-
-    payload = {
-        "model": MODEL,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "reasoning": {"effort": "low", "exclude": True},
-    }
-
-    last_error = None
-    for attempt in range(2):
-        try:
-            r = requests.post(API_URL, headers=headers, json=payload, timeout=120)
-            if not r.ok:
-                try:
-                    detail = r.json()
-                except Exception:
-                    detail = r.text
-                raise RuntimeError(f"OpenRouter error {r.status_code}: {detail}")
-
-            data = r.json()
-            choices = data.get("choices") or []
-            if not choices:
-                raise RuntimeError(f"OpenRouter returned no choices: {data}")
-
-            message = choices[0].get("message") or {}
-            content = message.get("content")
-
-            if isinstance(content, str) and content.strip():
-                return content.strip()
-
-            if isinstance(content, list):
-                parts = []
-                for item in content:
-                    if isinstance(item, str):
-                        parts.append(item)
-                    elif isinstance(item, dict):
-                        value = item.get("text") or item.get("content")
-                        if isinstance(value, str):
-                            parts.append(value)
-                joined = "\n".join(p for p in parts if p).strip()
-                if joined:
-                    return joined
-
-            finish_reason = choices[0].get("finish_reason")
-            provider_error = data.get("error")
-            raise RuntimeError(
-                "OpenRouter returned an empty answer "
-                f"(finish_reason={finish_reason}, error={provider_error})."
-            )
-
-        except Exception as exc:
-            last_error = exc
-            if attempt == 0:
-                continue
-
-    raise RuntimeError(
-        f"OpenRouter did not return a usable answer after retrying: {last_error}"
-    )
+def model_chat(messages, max_tokens=900, temperature=0.15):
+    """Provider-independent AI call. Google AI is preferred when configured; OpenRouter remains a fallback."""
+    return ai_chat(messages, max_tokens=max_tokens, temperature=temperature)
 
 
 def clean_ai_answer(text):
@@ -181,7 +119,7 @@ Return only 8-18 useful search terms/phrases, no explanation.
 Include likely official terminology and synonyms. If the question is Arabic, translate its planning meaning to English.
 User question: {question}"""
     try:
-        return openrouter_chat([{"role": "user", "content": prompt}], max_tokens=120, temperature=0)
+        return model_chat([{"role": "user", "content": prompt}], max_tokens=120, temperature=0)
     except Exception:
         return question
 
@@ -233,7 +171,7 @@ Retrieved UPPG excerpts:
 {context}
 """
 
-    answer = openrouter_chat(
+    answer = model_chat(
         [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
@@ -275,6 +213,8 @@ def render_public_facilities_table(rows):
 def render_message(m):
     with st.chat_message(m["role"]):
         st.markdown(m.get("content", ""))
+        if m.get("attachments"):
+            st.caption("📎 " + " · ".join(m.get("attachments") or []))
         if m.get("kind") == "public_facilities":
             render_public_facilities_table(m.get("table_rows") or [])
             result = m.get("result") or {}
@@ -348,7 +288,7 @@ Known service names for this project:
 PDF text:
 {extracted_text[:18000]}
 """
-    raw = openrouter_chat([{"role": "user", "content": prompt}], max_tokens=2200, temperature=0)
+    raw = model_chat([{"role": "user", "content": prompt}], max_tokens=2200, temperature=0)
     cleaned = raw.strip()
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\s*```$", "", cleaned)
@@ -428,13 +368,13 @@ def render_comparison_table(rows):
     df = pd.DataFrame(rows)
     def color_status(v):
         text = str(v)
-        if "عجز" in text:
+        if "عجز" in text or "Deficit" in text:
             return "background-color: #FEE4E2; color: #B42318; font-weight: 700"
-        if "مستوفى" in text:
+        if "مستوفى" in text or "Compliant" in text:
             return "background-color: #D1FADF; color: #027A48; font-weight: 700"
         return ""
     try:
-        st.dataframe(df.style.map(color_status, subset=["الحالة"]), use_container_width=True, hide_index=True)
+        st.dataframe(df.style.map(color_status, subset=["الحالة / Status"]), use_container_width=True, hide_index=True)
     except Exception:
         st.dataframe(df, use_container_width=True, hide_index=True)
 
@@ -451,7 +391,7 @@ st.markdown("""
 
 st.markdown('<div class="main-title">🏙️ Master Plan AI Assistant</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="sub">UPPG guidance + Public Facilities Calculator inside the same chat</div>',
+    '<div class="sub">Smart UPPG guidance + Public Facilities calculation, file review and compliance reporting in one chat</div>',
     unsafe_allow_html=True,
 )
 
@@ -463,11 +403,12 @@ with st.sidebar:
     st.header("Assistant")
     st.success("AI + UPPG RAG enabled")
     st.info("Public Facilities Calculator enabled")
-    st.caption(f"Model route: {MODEL}")
+    st.caption(f"AI route: {provider_label()}")
 
     if st.button("Reset conversation", use_container_width=True):
         st.session_state.messages = []
         st.session_state[PF_STATE_KEY] = new_flow_state()
+        st.session_state.pop(PF_PENDING_SUBMISSION_KEY, None)
         st.rerun()
 
     st.divider()
@@ -498,63 +439,120 @@ for col, label, q in quick:
 for m in st.session_state.messages:
     render_message(m)
 
-with st.expander("📎 مراجعة جدول الخدمات المقدم من المتعامل", expanded=False):
-    st.caption("بعد حساب الخدمات المطلوبة للمشروع، ارفع جدول المتعامل بصيغة Excel / CSV / TXT / PDF، وسيتم مقارنته بالمتطلبات وإظهار العجز وإصدار تقرير PDF.")
-    uploaded_pf = st.file_uploader(
-        "ارفع جدول الخدمات",
-        type=["xlsx", "xls", "csv", "txt", "pdf"],
-        key="pf_submission_upload",
-    )
-    compare_uploaded = st.button("🔍 راجع الجدول واكشف العجز", use_container_width=True)
+st.caption("📎 يمكنك إرفاق أو سحب Excel / CSV / TXT / PDF مباشرة إلى صندوق المحادثة. العربية والإنجليزية مدعومتان.")
 
-if compare_uploaded:
-    try:
-        submitted, _ = parse_uploaded_facilities(uploaded_pf)
-        event = build_comparison_chat_event(submitted, source_label=uploaded_pf.name if uploaded_pf else "الملف المقدم")
-    except Exception as e:
-        event = {"role": "assistant", "content": f"تعذر قراءة الملف أو مقارنته: `{e}`", "kind": "text"}
-    st.session_state.messages.append(event)
-    st.rerun()
+submission = st.chat_input(
+    "اكتب رسالتك أو أرفق جدول الخدمات هنا...",
+    accept_file="multiple",
+    file_type=["xlsx", "xls", "csv", "txt", "pdf"],
+    key="main_chat_input",
+)
 
-question = st.chat_input("اسأل عن UPPG، احسب الخدمات، أو الصق جدول الخدمات للمراجعة...")
-if "pending" in st.session_state and not question:
+question = ""
+uploaded_files = []
+if submission:
+    # With accept_file enabled Streamlit returns a ChatInputValue.
+    question = getattr(submission, "text", "") or ""
+    uploaded_files = list(getattr(submission, "files", []) or [])
+if "pending" in st.session_state and not question and not uploaded_files:
     question = st.session_state.pop("pending")
 
-if question:
-    user_event = {"role": "user", "content": question, "kind": "text"}
+if question or uploaded_files:
+    attachment_names = [f.name for f in uploaded_files]
+    visible_text = question.strip() or ("📎 " + "، ".join(attachment_names))
+    user_event = {
+        "role": "user", "content": visible_text, "kind": "text",
+        "attachments": attachment_names,
+    }
     st.session_state.messages.append(user_event)
     render_message(user_event)
 
-    # If the user asks for a comparison and pastes a text table, compare it against
-    # the most recent calculator result before falling back to normal Q&A.
     comparison_event = None
-    if detect_facilities_comparison_intent(question) and ("\n" in question or "|" in question or "\t" in question):
-        submitted = parse_csv_or_text_table(question)
-        if submitted:
-            comparison_event = build_comparison_chat_event(submitted, source_label="الجدول النصي المقدم في المحادثة")
+    pf_event = None
+    parsed_uploaded_rows = []
+    parse_errors = []
+
+    # 1) Attachments are handled inside the chat before any UPPG search.
+    for uploaded in uploaded_files:
+        try:
+            rows, _ = parse_uploaded_facilities(uploaded)
+            if rows:
+                parsed_uploaded_rows.extend(rows)
+            else:
+                parse_errors.append(f"{uploaded.name}: لم أجد صفوف خدمات قابلة للقراءة")
+        except Exception as exc:
+            parse_errors.append(f"{uploaded.name}: {exc}")
+
+    if parsed_uploaded_rows:
+        current_pf = st.session_state.get(PF_STATE_KEY) or {}
+        if current_pf.get("last_result"):
+            comparison_event = build_comparison_chat_event(
+                parsed_uploaded_rows,
+                source_label="، ".join(attachment_names) or "الملف المرفق",
+            )
+        else:
+            # Keep the uploaded schedule in memory while the assistant asks for area/population.
+            st.session_state[PF_PENDING_SUBMISSION_KEY] = {
+                "rows": parsed_uploaded_rows,
+                "source_label": "، ".join(attachment_names) or "الملف المرفق",
+            }
+            pf_prompt = (question + "\nاحسب الخدمات العامة").strip()
+            pf_event = handle_public_facilities_turn(pf_prompt)
+
+    # 2) Pasted Arabic/English schedules are recognized even if the user did not say the word 'compare'.
+    if comparison_event is None and not parsed_uploaded_rows and question:
+        pending = st.session_state.get(PF_PENDING_SUBMISSION_KEY)
+        if detect_facilities_comparison_intent(question) and pending and pending.get("rows"):
+            comparison_event = build_comparison_chat_event(
+                pending["rows"], source_label=pending.get("source_label", "الملف المرفق")
+            )
+            st.session_state.pop(PF_PENDING_SUBMISSION_KEY, None)
+        elif looks_like_facilities_table(question) or (detect_facilities_comparison_intent(question) and ("\n" in question or "|" in question or "\t" in question)):
+            submitted_rows = parse_csv_or_text_table(question)
+            if submitted_rows:
+                current_pf = st.session_state.get(PF_STATE_KEY) or {}
+                if current_pf.get("last_result"):
+                    comparison_event = build_comparison_chat_event(submitted_rows, source_label="الجدول النصي المقدم في المحادثة")
+                else:
+                    st.session_state[PF_PENDING_SUBMISSION_KEY] = {"rows": submitted_rows, "source_label": "الجدول النصي المقدم في المحادثة"}
+                    pf_event = handle_public_facilities_turn("احسب الخدمات العامة")
+
+    # 3) Continue / start calculator before falling back to UPPG.
+    if comparison_event is None and pf_event is None and question:
+        pf_event = handle_public_facilities_turn(question)
 
     if comparison_event is not None:
         render_message(comparison_event)
         st.session_state.messages.append(comparison_event)
-        pf_event = None
-    else:
-        # IMPORTANT: calculator workflow gets the turn first. If not applicable,
-        # the question falls back to the existing UPPG RAG assistant.
-        pf_event = handle_public_facilities_turn(question)
-
-    if comparison_event is not None:
-        pass
     elif pf_event is not None:
         render_message(pf_event)
         st.session_state.messages.append(pf_event)
-    else:
+
+        # If a schedule was attached first, auto-compare immediately after area/population calculation completes.
+        if pf_event.get("result"):
+            pending = st.session_state.get(PF_PENDING_SUBMISSION_KEY)
+            if pending and pending.get("rows"):
+                auto_event = build_comparison_chat_event(
+                    pending["rows"], source_label=pending.get("source_label", "الملف/الجدول المقدم")
+                )
+                render_message(auto_event)
+                st.session_state.messages.append(auto_event)
+                st.session_state.pop(PF_PENDING_SUBMISSION_KEY, None)
+    elif parse_errors:
+        event = {
+            "role": "assistant",
+            "content": "تعذر قراءة بعض المرفقات:\n- " + "\n- ".join(parse_errors) +
+                       "\n\nتأكد أن الملف يحتوي على جدول خدمات واضح. PDF الممسوح كصورة فقط قد يحتاج نسخة نصية/Excel.",
+            "kind": "text",
+        }
+        render_message(event)
+        st.session_state.messages.append(event)
+    elif question:
+        # Only genuine planning Q&A reaches the UPPG retrieval path. Facility tables/files never fall through here.
         with st.chat_message("assistant"):
-            with st.spinner("Understanding the question and searching the UPPG…"):
+            with st.spinner("Understanding the planning question and searching the UPPG…"):
                 try:
-                    answer, retrieved, expanded = answer_question(
-                        question,
-                        st.session_state.messages[:-1],
-                    )
+                    answer, retrieved, expanded = answer_question(question, st.session_state.messages[:-1])
                     st.markdown(answer)
                     with st.expander("Retrieved UPPG evidence"):
                         st.caption(f"Search expansion: {expanded}")
@@ -565,12 +563,7 @@ if question:
                 except Exception as e:
                     answer = f"⚠️ AI service is not ready: `{e}`"
                     st.error(answer)
-
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": answer,
-            "kind": "text",
-        })
+        st.session_state.messages.append({"role": "assistant", "content": answer, "kind": "text"})
 
 st.divider()
 st.caption(

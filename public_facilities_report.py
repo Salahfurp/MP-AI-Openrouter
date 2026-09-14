@@ -7,7 +7,7 @@ from typing import Any
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_LEFT, TA_RIGHT
-from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.pagesizes import A3, landscape
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
@@ -71,16 +71,16 @@ def _fmt(v, decimals=0):
         return str(v)
 
 
-def build_comparison_pdf(report: dict[str, Any], title: str = "تقرير مراجعة الخدمات العامة") -> bytes:
+def build_comparison_pdf(report: dict[str, Any], title: str = "تقرير مراجعة الخدمات العامة / Public Facilities Compliance Review") -> bytes:
     font, bold = _register_fonts()
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,
-        pagesize=landscape(A4),
-        rightMargin=12 * mm,
-        leftMargin=12 * mm,
-        topMargin=12 * mm,
-        bottomMargin=12 * mm,
+        pagesize=landscape(A3),
+        rightMargin=10 * mm,
+        leftMargin=10 * mm,
+        topMargin=10 * mm,
+        bottomMargin=10 * mm,
         title="Public Facilities Review Report",
     )
 
@@ -100,9 +100,9 @@ def build_comparison_pdf(report: dict[str, Any], title: str = "تقرير مرا
     project = report.get("project", {})
     summary = report.get("summary", {})
     story = [
-        Paragraph(_ar(title), title_style),
-        Paragraph(_ar("Public Facilities Compliance Review"), ParagraphStyle(
-            "PFSub", parent=body_style, fontName=bold, fontSize=11, textColor=colors.HexColor("#475467")
+        Paragraph(_ar("تقرير مراجعة الخدمات العامة"), title_style),
+        Paragraph("Public Facilities Compliance Review", ParagraphStyle(
+            "PFSub", parent=body_style, fontName=bold, fontSize=11, textColor=colors.HexColor("#475467"), alignment=TA_LEFT
         )),
         Spacer(1, 5 * mm),
     ]
@@ -136,11 +136,14 @@ def build_comparison_pdf(report: dict[str, Any], title: str = "تقرير مرا
     ), body_style))
     story.append(Spacer(1, 4*mm))
 
-    headers = [
-        "الحالة", "المستوى", "الخدمة", "المطلوب", "المقدم", "عجز العدد",
-        "الأرض المطلوبة", "الأرض المقدمة", "عجز الأرض", "GFA المطلوب", "GFA المقدم", "ملاحظات"
+    header_pairs = [
+        ("الحالة", "Status"), ("المستوى", "Level"), ("الخدمة المطلوبة", "Required service"),
+        ("اسم الخدمة المقدم", "Submitted name"), ("المطلوب", "Required"), ("المقدم", "Provided"),
+        ("عجز العدد", "Count deficit"), ("الأرض المطلوبة", "Required land"),
+        ("الأرض المقدمة", "Provided land"), ("عجز الأرض", "Land deficit"),
+        ("GFA المطلوب", "Required GFA"), ("GFA المقدم", "Provided GFA"), ("ملاحظات", "Notes")
     ]
-    data = [[Paragraph(_ar(h), small_style) for h in headers]]
+    data = [[Paragraph(f"{_ar(ar)}<br/>{en}", small_style) for ar, en in header_pairs]]
     row_statuses = []
     for x in report.get("comparisons", []):
         ok = x.get("status") == "مستوفى"
@@ -150,6 +153,7 @@ def build_comparison_pdf(report: dict[str, Any], title: str = "تقرير مرا
             status,
             x.get("level"),
             x.get("service"),
+            x.get("matched_submission_service"),
             _fmt(x.get("required_count")),
             _fmt(x.get("provided_count")),
             _fmt(x.get("count_deficit")),
@@ -162,7 +166,7 @@ def build_comparison_pdf(report: dict[str, Any], title: str = "تقرير مرا
         ]
         data.append([Paragraph(_ar(v), small_style) for v in vals])
 
-    widths = [20, 29, 37, 17, 17, 18, 23, 23, 22, 22, 22, 48]
+    widths = [20, 28, 36, 36, 16, 16, 17, 22, 22, 20, 21, 21, 43]
     table = Table(data, repeatRows=1, colWidths=[w*mm for w in widths])
     ts = [
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#101828")),
