@@ -1,5 +1,7 @@
 import os
 import re
+import json
+import io
 from pathlib import Path
 
 import pandas as pd
@@ -8,7 +10,7 @@ from rank_bm25 import BM25Okapi
 
 from ai_provider import ai_chat, provider_label
 
-from public_facilities_chat import new_flow_state, process_public_facilities_turn
+from public_facilities_chat import new_flow_state, process_public_facilities_turn, detect_public_facilities_intent
 from public_facilities_comparison import (
     SubmittedFacility, compare_facilities, comparison_rows, parse_csv_or_text_table,
     parse_excel_bytes, parse_pdf_bytes, looks_like_facilities_table,
@@ -19,6 +21,8 @@ APP_DIR = Path(__file__).parent
 TEXT_PATH = APP_DIR / "guide_pages.txt"
 PF_STATE_KEY = "public_facilities_flow"
 PF_PENDING_SUBMISSION_KEY = "pending_public_facilities_submission"
+PF_REVIEW_REQUESTED_KEY = "public_facilities_review_requested"
+PF_GOAL_KEY = "public_facilities_goal"  # calculate | review
 PF_COMPARE_KEYWORDS = (
     "قارن", "مقارنة", "قارنها", "قارنه", "راجع الخدمات", "راجع الجدول", "راجع الملف",
     "العجز", "ترجم وقارن", "ترجمه واعمل المقارنة", "ترجم الجدول", "حلل الجدول",
@@ -113,40 +117,122 @@ def clean_ai_answer(text):
     return cleaned
 
 
-def expand_query(question):
-    prompt = f"""Convert the user's question into a compact English search query for an Urban Planning Permits Guideline.
-Return only 8-18 useful search terms/phrases, no explanation.
-Include likely official terminology and synonyms. If the question is Arabic, translate its planning meaning to English.
-User question: {question}"""
-    try:
-        return model_chat([{"role": "user", "content": prompt}], max_tokens=120, temperature=0)
-    except Exception:
-        return question
+def _normalized_question(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
 
 
-def retrieve(question, top_k=8):
+UPPG_SEARCH_PROFILES = {
+    "requirements": {
+        "triggers": (
+            "what documents", "documents required", "required documents", "requirements",
+            "submission requirements", "checklist", "متطلبات", "المتطلبات", "المستندات",
+            "الوثائق", "الاوراق", "الأوراق", "قائمة التحقق",
+        ),
+        "terms": (
+            "Master Plan Permit required documents submission requirements checklist "
+            "application supporting documents property specifications studies attachments"
+        ),
+        "boost": (
+            "checklist", "required", "requirements", "documents", "submission",
+            "supporting documents", "property specifications", "master plan permit",
+        ),
+    },
+    "process": {
+        "triggers": (
+            "approval process", "process", "steps", "procedure", "workflow",
+            "اجراءات", "إجراءات", "الخطوات", "عملية الاعتماد", "مسار الاعتماد",
+        ),
+        "terms": (
+            "Master Plan Permit approval process procedure workflow steps stages "
+            "submission review approval resubmission"
+        ),
+        "boost": ("process", "procedure", "steps", "stage", "review", "approval", "submission"),
+    },
+    "dubai2040": {
+        "triggers": ("dubai 2040", "2040", "مواءمة", "دبي 2040"),
+        "terms": (
+            "Dubai 2040 Urban Master Plan alignment consistency strategic planning "
+            "master plan alignment requirement"
+        ),
+        "boost": ("dubai 2040", "alignment", "urban master plan", "strategic"),
+    },
+    "modification": {
+        "triggers": (
+            "modification", "major modification", "minor modification",
+            "تعديل", "تعديل جوهري", "تعديل رئيسي",
+        ),
+        "terms": (
+            "Master Plan modification major modification minor modification requirements studies "
+            "permit amendment"
+        ),
+        "boost": ("modification", "major", "minor", "amendment", "study", "studies"),
+    },
+    "studies": {
+        "triggers": ("studies", "study", "traffic", "environment", "دراسات", "دراسة"),
+        "terms": (
+            "Master Plan supporting studies traffic impact study environmental study "
+            "infrastructure study qualified professionals"
+        ),
+        "boost": ("study", "studies", "traffic", "environment", "supporting"),
+    },
+}
+
+
+def detect_uppg_search_profile(question: str) -> str | None:
+    q = _normalized_question(question)
+    for name, profile in UPPG_SEARCH_PROFILES.items():
+        if any(trigger in q for trigger in profile["triggers"]):
+            return name
+    return None
+
+
+def build_retrieval_query(question: str) -> tuple[str, str | None]:
+    """Deterministic retrieval query.
+
+    Deliberately does NOT call an LLM. The previous implementation allowed model
+    reasoning text to leak into BM25 and corrupt retrieval.
+    """
+    profile_name = detect_uppg_search_profile(question)
+    if not profile_name:
+        return question, None
+    return f"{question} {UPPG_SEARCH_PROFILES[profile_name]['terms']}", profile_name
+
+
+def retrieve(question, top_k=10):
     chunks, bm25 = load_guide()
-    expanded = expand_query(question)
-    query_tokens = tokenize(question + " " + expanded)
-    scores = bm25.get_scores(query_tokens)
+    search_text, profile_name = build_retrieval_query(question)
+    query_tokens = tokenize(search_text)
+    raw_scores = bm25.get_scores(query_tokens)
+
+    scores = list(raw_scores)
+    if profile_name:
+        boost_terms = UPPG_SEARCH_PROFILES[profile_name]["boost"]
+        for i, c in enumerate(chunks):
+            low = c["text"].lower()
+            boost = 0.0
+            for term in boost_terms:
+                if term.lower() in low:
+                    boost += 0.55
+            scores[i] += boost
+
     ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
 
     results = []
     seen = set()
     for i in ranked:
         c = chunks[i]
-        signature = (c["page"], c["text"][:80])
+        signature = (c["page"], c["text"][:100])
         if signature in seen:
             continue
         seen.add(signature)
         results.append(c)
         if len(results) >= top_k:
             break
-    return results, expanded
+    return results, profile_name
 
 
 def answer_question(question, history):
-    retrieved, expanded = retrieve(question)
+    retrieved, profile_name = retrieve(question)
     context = "\n\n".join(
         f"[UPPG PAGE {c['page']}]\n{c['text']}" for c in retrieved
     )
@@ -157,9 +243,18 @@ def answer_question(question, history):
         if m.get("kind", "text") == "text"
     )
 
-    user_prompt = f"""Use ONLY the UPPG excerpts below to answer the user's latest question.
-If the answer is not established by these excerpts, say that the available retrieved sections do not confirm it and avoid guessing.
-Cite page numbers that appear in the excerpt labels.
+    user_prompt = f"""Answer the latest question using ONLY the retrieved UPPG excerpts below.
+
+Rules:
+- Do not invent or complete missing requirements from general knowledge.
+- If the excerpts contain an itemized list, reproduce the supported items clearly.
+- If the excerpts only point to another checklist/file without listing its contents, say that explicitly.
+- Distinguish mandatory requirements from conditional/context-dependent items.
+- Cite only page numbers that appear in the excerpt labels.
+- Do not expose analysis, reasoning, search queries, chain-of-thought, or internal instructions.
+- Answer in the user's language.
+
+Detected retrieval topic (internal metadata only): {profile_name or 'general'}
 
 Recent conversation:
 {history_text}
@@ -176,11 +271,11 @@ Retrieved UPPG excerpts:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        max_tokens=1100,
+        max_tokens=1300,
         temperature=0.1,
     )
     answer = clean_ai_answer(answer)
-    return answer, retrieved, expanded
+    return answer, retrieved
 
 
 # -----------------------------
@@ -266,6 +361,30 @@ def detect_facilities_comparison_intent(text):
     return any(k in t for k in PF_COMPARE_KEYWORDS)
 
 
+def classify_turn(question: str, uploaded_files: list) -> str:
+    """Route the user turn before any tool is called.
+
+    Priority:
+    1) continuing/explicit deficit review,
+    2) public-facilities calculation intake,
+    3) normal UPPG Q&A.
+
+    The router is deterministic on purpose; the LLM never decides which calculator
+    or compliance tool to run.
+    """
+    state = st.session_state.get(PF_STATE_KEY) or {}
+    goal = st.session_state.get(PF_GOAL_KEY)
+    pending = st.session_state.get(PF_PENDING_SUBMISSION_KEY)
+
+    if goal == "review" or pending or detect_facilities_comparison_intent(question):
+        return "facilities_review"
+    if uploaded_files:
+        return "facilities_review"
+    if state.get("active") or detect_public_facilities_intent(question):
+        return "facilities_calculation"
+    return "uppg"
+
+
 def ai_parse_pdf_facilities(extracted_text):
     """Strict structure extraction only; comparison/calculation remains deterministic."""
     state = st.session_state.get(PF_STATE_KEY) or {}
@@ -297,13 +416,94 @@ PDF text:
     return data if isinstance(data, list) else []
 
 
+def ai_parse_excel_facilities(data: bytes, filename: str = "submission.xlsx"):
+    """AI fallback for messy bilingual consultant workbooks.
+
+    It does NOT decide compliance. It only converts visible workbook rows to a neutral
+    structure when deterministic header detection cannot reliably read the schedule.
+    """
+    try:
+        sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, header=None)
+    except Exception:
+        return []
+
+    previews = []
+    for sheet_name, df in sheets.items():
+        if df is None or df.empty:
+            continue
+        # Keep the prompt bounded while preserving title/header rows and enough schedule rows.
+        view = df.iloc[:100, :24].copy()
+        view = view.where(pd.notna(view), "")
+        previews.append(f"SHEET: {sheet_name}\n" + view.to_csv(index=False, header=False))
+    if not previews:
+        return []
+
+    prompt = f"""You extract a submitted public-facilities schedule from an Excel workbook.
+The workbook may be Arabic, English, bilingual, have title rows, merged-looking headers, abbreviations, or reordered columns.
+Return ONLY a JSON array; no markdown and no explanation.
+Each object must have exactly these keys:
+service, count, land_area_m2, gfa_m2, level
+Rules:
+- A facility/service row must represent a real public-facility item, not a heading or total.
+- Keep the service label as written in the workbook. Do NOT translate it and do NOT decide whether it complies.
+- Extract count, total land/site area, and GFA only when explicitly present; otherwise null.
+- Understand Arabic and English column names and common variants such as Facility Type, Service, No., Qty, Site Area, Plot Area, Land Area, GFA, BUA, Gross Floor Area.
+- Do not invent numbers.
+
+Workbook: {filename}
+{chr(10).join(previews)[:26000]}
+"""
+    try:
+        raw = model_chat([{"role": "user", "content": prompt}], max_tokens=3200, temperature=0)
+        cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.I)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+        data_json = json.loads(cleaned)
+        out = []
+        if not isinstance(data_json, list):
+            return []
+        for x in data_json:
+            if not isinstance(x, dict):
+                continue
+            service = str(x.get("service", "")).strip()
+            if not service:
+                continue
+            def n(v):
+                if v is None or v == "": return None
+                try: return float(str(v).replace(",", ""))
+                except Exception: return None
+            out.append(SubmittedFacility(
+                service=service,
+                count=n(x.get("count")),
+                land_area_m2=n(x.get("land_area_m2")),
+                gfa_m2=n(x.get("gfa_m2")),
+                level=(str(x.get("level")).strip() if x.get("level") not in (None, "") else None),
+                source_row=json.dumps(x, ensure_ascii=False),
+            ))
+        return out
+    except Exception:
+        return []
+
+
+def _rows_are_plausible(rows):
+    if not rows:
+        return False
+    # Require actual text labels; pure serial-number columns are not a facilities schedule.
+    text_rows = [r for r in rows if re.search(r"[A-Za-z\u0600-\u06FF]", str(getattr(r, "service", "")))]
+    return len(text_rows) >= 1
+
+
 def parse_uploaded_facilities(uploaded_file):
     if uploaded_file is None:
         return [], None
     name = uploaded_file.name.lower()
     data = uploaded_file.getvalue()
     if name.endswith((".xlsx", ".xls")):
-        return parse_excel_bytes(data, uploaded_file.name), None
+        rows = parse_excel_bytes(data, uploaded_file.name)
+        if _rows_are_plausible(rows):
+            return rows, None
+        # Messy workbook fallback: let the AI identify the table structure only.
+        rows = ai_parse_excel_facilities(data, uploaded_file.name)
+        return rows, None
     if name.endswith(".csv"):
         return parse_csv_or_text_table(data.decode("utf-8", errors="ignore")), None
     if name.endswith(".txt"):
@@ -314,13 +514,70 @@ def parse_uploaded_facilities(uploaded_file):
     raise ValueError("صيغة الملف غير مدعومة. استخدم Excel أو CSV أو TXT أو PDF.")
 
 
+def build_semantic_service_map(required_result, submitted_rows):
+    """Use the configured AI only to resolve ambiguous service-name equivalence.
+
+    Calculations and compliance remain deterministic. The model must choose only from
+    the project's already-calculated official service list or return null.
+    """
+    required_names = [
+        re.sub(r"[❶❷❸]", "", str(x.get("service", ""))).strip()
+        for x in (required_result.get("required") or [])
+        if x.get("service")
+    ]
+    submitted_names = [str(x.service).strip() for x in submitted_rows if str(x.service).strip()]
+    if not required_names or not submitted_names:
+        return {}
+
+    prompt = f"""You are a bilingual Arabic-English public-facilities terminology matcher.
+Your ONLY task is semantic name matching; do not calculate compliance and do not infer quantities.
+For each submitted label, choose the SAME facility concept from the exact allowed official list, even when:
+- Arabic/English differ,
+- wording/order differs,
+- common abbreviations or planning synonyms are used,
+- minor spelling errors exist.
+Do NOT match merely because two items are both schools, mosques, parks, clinics, etc. Preserve subtype distinctions.
+If no reliable equivalent exists, use null.
+Return ONLY a JSON array with keys: submitted, official, confidence. confidence is 0 to 1.
+
+Allowed official services:
+{json.dumps(required_names, ensure_ascii=False)}
+
+Submitted labels:
+{json.dumps(submitted_names, ensure_ascii=False)}
+"""
+    try:
+        raw = model_chat([{"role": "user", "content": prompt}], max_tokens=1800, temperature=0)
+        cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.I)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+        data = json.loads(cleaned)
+        allowed = set(required_names)
+        out = {}
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                submitted = str(item.get("submitted", "")).strip()
+                official = item.get("official")
+                official = str(official).strip() if official is not None else None
+                try:
+                    confidence = float(item.get("confidence", 0) or 0)
+                except Exception:
+                    confidence = 0.0
+                if submitted and official in allowed and confidence >= 0.70:
+                    out[submitted] = (official, min(max(confidence, 0.0), 1.0))
+        return out
+    except Exception:
+        return {}
+
+
 def build_comparison_chat_event(submitted_rows, source_label="الجدول المقدم"):
     state = st.session_state.get(PF_STATE_KEY) or {}
     required_result = state.get("last_result")
     if not required_result:
         return {
             "role": "assistant",
-            "content": "قبل مراجعة جدول الخدمات، أحتاج أولًا حساب المتطلبات للمشروع. اطلب **حساب الخدمات العامة** وأدخل مساحة الأرض وعدد السكان، ثم أعد إرسال الجدول للمقارنة.",
+            "content": "سأحتفظ بالجدول وأكمل مراجعة العجز تلقائيًا. أحتاج فقط **مساحة المشروع** و**عدد السكان** لحساب المتطلبات المرجعية أولًا؛ لن تحتاج إلى إعادة رفع الملف أو طلب المقارنة مرة ثانية.",
             "kind": "text",
         }
     if not submitted_rows:
@@ -330,7 +587,8 @@ def build_comparison_chat_event(submitted_rows, source_label="الجدول ال�
             "kind": "text",
         }
 
-    report = compare_facilities(required_result, submitted_rows)
+    semantic_map = build_semantic_service_map(required_result, submitted_rows)
+    report = compare_facilities(required_result, submitted_rows, semantic_map=semantic_map)
     rows = comparison_rows(report)
     summary = report.get("summary", {})
     deficits = [x for x in report.get("comparisons", []) if x.get("status") == "عجز"]
@@ -409,6 +667,8 @@ with st.sidebar:
         st.session_state.messages = []
         st.session_state[PF_STATE_KEY] = new_flow_state()
         st.session_state.pop(PF_PENDING_SUBMISSION_KEY, None)
+        st.session_state.pop(PF_REVIEW_REQUESTED_KEY, None)
+        st.session_state.pop(PF_GOAL_KEY, None)
         st.rerun()
 
     st.divider()
@@ -472,98 +732,150 @@ if question or uploaded_files:
     parsed_uploaded_rows = []
     parse_errors = []
 
-    # 1) Attachments are handled inside the chat before any UPPG search.
+    turn_route = classify_turn(question, uploaded_files)
+    explicit_review_intent = (turn_route == "facilities_review" and detect_facilities_comparison_intent(question))
+    pending_before = st.session_state.get(PF_PENDING_SUBMISSION_KEY)
+    continuing_review = st.session_state.get(PF_GOAL_KEY) == "review" or bool(pending_before)
+
+    # A review/deficit request is a persistent goal, not just a keyword on one turn.
+    if explicit_review_intent:
+        st.session_state[PF_GOAL_KEY] = "review"
+        st.session_state[PF_REVIEW_REQUESTED_KEY] = True
+    elif uploaded_files and (continuing_review or not question.strip()):
+        # A file dropped while a review is in progress belongs to that review.
+        st.session_state[PF_GOAL_KEY] = "review"
+        st.session_state[PF_REVIEW_REQUESTED_KEY] = True
+
+    goal = st.session_state.get(PF_GOAL_KEY)
+
+    # 1) Parse attachments FIRST. A failed review attachment must never silently fall through
+    # to the calculator or UPPG and produce an unrelated answer.
     for uploaded in uploaded_files:
         try:
             rows, _ = parse_uploaded_facilities(uploaded)
             if rows:
                 parsed_uploaded_rows.extend(rows)
             else:
-                parse_errors.append(f"{uploaded.name}: لم أجد صفوف خدمات قابلة للقراءة")
+                parse_errors.append(f"{uploaded.name}: لم أستطع تحديد صفوف خدمات عامة داخل الملف")
         except Exception as exc:
             parse_errors.append(f"{uploaded.name}: {exc}")
 
     if parsed_uploaded_rows:
-        current_pf = st.session_state.get(PF_STATE_KEY) or {}
-        if current_pf.get("last_result"):
-            comparison_event = build_comparison_chat_event(
-                parsed_uploaded_rows,
-                source_label="، ".join(attachment_names) or "الملف المرفق",
-            )
-        else:
-            # Keep the uploaded schedule in memory while the assistant asks for area/population.
-            st.session_state[PF_PENDING_SUBMISSION_KEY] = {
-                "rows": parsed_uploaded_rows,
-                "source_label": "، ".join(attachment_names) or "الملف المرفق",
-            }
-            pf_prompt = (question + "\nاحسب الخدمات العامة").strip()
-            pf_event = handle_public_facilities_turn(pf_prompt)
+        st.session_state[PF_PENDING_SUBMISSION_KEY] = {
+            "rows": parsed_uploaded_rows,
+            "source_label": "، ".join(attachment_names) or "الملف المرفق",
+        }
+        st.session_state[PF_GOAL_KEY] = "review"
+        st.session_state[PF_REVIEW_REQUESTED_KEY] = True
+        goal = "review"
 
-    # 2) Pasted Arabic/English schedules are recognized even if the user did not say the word 'compare'.
-    if comparison_event is None and not parsed_uploaded_rows and question:
-        pending = st.session_state.get(PF_PENDING_SUBMISSION_KEY)
-        if detect_facilities_comparison_intent(question) and pending and pending.get("rows"):
-            comparison_event = build_comparison_chat_event(
-                pending["rows"], source_label=pending.get("source_label", "الملف المرفق")
-            )
-            st.session_state.pop(PF_PENDING_SUBMISSION_KEY, None)
-        elif looks_like_facilities_table(question) or (detect_facilities_comparison_intent(question) and ("\n" in question or "|" in question or "\t" in question)):
-            submitted_rows = parse_csv_or_text_table(question)
-            if submitted_rows:
-                current_pf = st.session_state.get(PF_STATE_KEY) or {}
-                if current_pf.get("last_result"):
-                    comparison_event = build_comparison_chat_event(submitted_rows, source_label="الجدول النصي المقدم في المحادثة")
-                else:
-                    st.session_state[PF_PENDING_SUBMISSION_KEY] = {"rows": submitted_rows, "source_label": "الجدول النصي المقدم في المحادثة"}
-                    pf_event = handle_public_facilities_turn("احسب الخدمات العامة")
-
-    # 3) Continue / start calculator before falling back to UPPG.
-    if comparison_event is None and pf_event is None and question:
-        pf_event = handle_public_facilities_turn(question)
-
-    if comparison_event is not None:
-        render_message(comparison_event)
-        st.session_state.messages.append(comparison_event)
-    elif pf_event is not None:
-        render_message(pf_event)
-        st.session_state.messages.append(pf_event)
-
-        # If a schedule was attached first, auto-compare immediately after area/population calculation completes.
-        if pf_event.get("result"):
-            pending = st.session_state.get(PF_PENDING_SUBMISSION_KEY)
-            if pending and pending.get("rows"):
-                auto_event = build_comparison_chat_event(
-                    pending["rows"], source_label=pending.get("source_label", "الملف/الجدول المقدم")
-                )
-                render_message(auto_event)
-                st.session_state.messages.append(auto_event)
-                st.session_state.pop(PF_PENDING_SUBMISSION_KEY, None)
-    elif parse_errors:
+    # Hard stop for a review file that could not be read. Do not answer with a cached calculation.
+    if uploaded_files and not parsed_uploaded_rows and parse_errors and (goal == "review" or explicit_review_intent):
         event = {
             "role": "assistant",
-            "content": "تعذر قراءة بعض المرفقات:\n- " + "\n- ".join(parse_errors) +
-                       "\n\nتأكد أن الملف يحتوي على جدول خدمات واضح. PDF الممسوح كصورة فقط قد يحتاج نسخة نصية/Excel.",
+            "content": (
+                "أنا فاهم أن المطلوب **حساب العجز ومقارنة الملف**، وليس إعادة حساب الخدمات فقط. "
+                "لكن لم أستطع استخراج جدول خدمات موثوق من المرفق، لذلك لن أعطيك نتيجة غير مرتبطة بطلبك.\n\n"
+                "تفاصيل القراءة:\n- " + "\n- ".join(parse_errors) +
+                "\n\nجرّب نفس الملف بعد التأكد أن أسماء الخدمات والأعداد موجودة كخلايا داخل Excel، "
+                "أو أرسل نسخة PDF/Excel أخرى."
+            ),
             "kind": "text",
         }
         render_message(event)
         st.session_state.messages.append(event)
-    elif question:
-        # Only genuine planning Q&A reaches the UPPG retrieval path. Facility tables/files never fall through here.
-        with st.chat_message("assistant"):
-            with st.spinner("Understanding the planning question and searching the UPPG…"):
-                try:
-                    answer, retrieved, expanded = answer_question(question, st.session_state.messages[:-1])
-                    st.markdown(answer)
-                    with st.expander("Retrieved UPPG evidence"):
-                        st.caption(f"Search expansion: {expanded}")
-                        for c in retrieved:
-                            st.markdown(f"**Page {c['page']}**")
-                            st.write(c["text"][:1200] + ("…" if len(c["text"]) > 1200 else ""))
-                            st.divider()
-                except Exception as e:
-                    answer = f"⚠️ AI service is not ready: `{e}`"
-                    st.error(answer)
-        st.session_state.messages.append({"role": "assistant", "content": answer, "kind": "text"})
+    else:
+        # 2) Text tables pasted into chat are also part of the review workflow.
+        if not parsed_uploaded_rows and question and (
+            looks_like_facilities_table(question) or
+            (explicit_review_intent and ("\n" in question or "|" in question or "\t" in question))
+        ):
+            submitted_rows = parse_csv_or_text_table(question)
+            if submitted_rows:
+                st.session_state[PF_PENDING_SUBMISSION_KEY] = {
+                    "rows": submitted_rows,
+                    "source_label": "الجدول النصي المقدم في المحادثة",
+                }
+                st.session_state[PF_GOAL_KEY] = "review"
+                st.session_state[PF_REVIEW_REQUESTED_KEY] = True
+                goal = "review"
+
+        pending = st.session_state.get(PF_PENDING_SUBMISSION_KEY)
+        current_pf = st.session_state.get(PF_STATE_KEY) or {}
+        have_reference = bool(current_pf.get("last_result"))
+
+        # 3) If the goal is a deficit/compliance review and we already have both the
+        # reference calculation and a submitted schedule, compare NOW. Never show the
+        # generic calculator table first.
+        if goal == "review" and pending and pending.get("rows") and have_reference and not current_pf.get("active"):
+            comparison_event = build_comparison_chat_event(
+                pending["rows"], source_label=pending.get("source_label", "الملف/الجدول المقدم")
+            )
+            render_message(comparison_event)
+            st.session_state.messages.append(comparison_event)
+            st.session_state.pop(PF_PENDING_SUBMISSION_KEY, None)
+            st.session_state[PF_REVIEW_REQUESTED_KEY] = False
+            st.session_state[PF_GOAL_KEY] = None
+        else:
+            # 4) A review with no reference calculation uses the calculator only as an
+            # internal intake step. Ask only for missing area/population.
+            should_run_pf = False
+            pf_prompt = question
+            if goal == "review":
+                should_run_pf = True
+                # Force entry into the facilities state machine even when the user's wording
+                # is simply "العجز" or the turn contains only a number.
+                if not current_pf.get("active") and not have_reference:
+                    pf_prompt = ((question or "") + "\nاحسب الخدمات العامة").strip()
+            elif turn_route == "facilities_calculation" and question:
+                should_run_pf = True
+
+            if should_run_pf and pf_prompt:
+                pf_event = handle_public_facilities_turn(pf_prompt)
+
+            if pf_event is not None:
+                # If this was only an internal calculation step for a review, do not dump the
+                # full requirements table into chat. Once complete, move directly to comparison.
+                if goal == "review" and pf_event.get("result"):
+                    pending = st.session_state.get(PF_PENDING_SUBMISSION_KEY)
+                    if pending and pending.get("rows"):
+                        comparison_event = build_comparison_chat_event(
+                            pending["rows"], source_label=pending.get("source_label", "الملف/الجدول المقدم")
+                        )
+                        render_message(comparison_event)
+                        st.session_state.messages.append(comparison_event)
+                        st.session_state.pop(PF_PENDING_SUBMISSION_KEY, None)
+                        st.session_state[PF_REVIEW_REQUESTED_KEY] = False
+                        st.session_state[PF_GOAL_KEY] = None
+                    else:
+                        follow = {
+                            "role": "assistant",
+                            "content": (
+                                "تم تحديد المتطلبات المرجعية للمشروع. الآن أرفق أو اسحب **جدول الخدمات التي وفرتها** "
+                                "(Excel / CSV / TXT / PDF)، وسأحسب العجز مباشرة وأصدر تقرير المقارنة."
+                            ),
+                            "kind": "text",
+                        }
+                        render_message(follow)
+                        st.session_state.messages.append(follow)
+                else:
+                    render_message(pf_event)
+                    st.session_state.messages.append(pf_event)
+            elif question and goal != "review" and turn_route == "uppg":
+                with st.chat_message("assistant"):
+                    with st.spinner("Searching the UPPG and preparing the answer…"):
+                        try:
+                            answer, retrieved = answer_question(question, st.session_state.messages[:-1])
+                            st.markdown(answer)
+                            with st.expander("Retrieved UPPG evidence"):
+                                for c in retrieved:
+                                    st.markdown(f"**Page {c['page']}**")
+                                    st.write(c["text"][:1200] + ("…" if len(c["text"]) > 1200 else ""))
+                                    st.divider()
+                        except Exception as e:
+                            answer = f"⚠️ AI service is not ready: `{e}`"
+                            st.error(answer)
+                st.session_state.messages.append({"role": "assistant", "content": answer, "kind": "text"})
 
 st.divider()
 st.caption(

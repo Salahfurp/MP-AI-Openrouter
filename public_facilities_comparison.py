@@ -148,6 +148,30 @@ def _header_score(values: list[Any]) -> int:
     return score
 
 
+def _unique_headers(values: list[Any]) -> list[str]:
+    """Create stable unique column names even when Excel repeats labels such as Area/Area."""
+    used: dict[str, int] = {}
+    out: list[str] = []
+    for j, v in enumerate(values):
+        base = str(v).strip() if pd.notna(v) else ""
+        base = base or f"column_{j+1}"
+        key = _norm(base) or f"column_{j+1}"
+        used[key] = used.get(key, 0) + 1
+        out.append(base if used[key] == 1 else f"{base}__{used[key]}")
+    return out
+
+
+def _cell(row: pd.Series, col: Any) -> Any:
+    """Return a scalar even if a malformed/duplicate header would otherwise yield a Series."""
+    if col is None:
+        return None
+    value = row.get(col)
+    if isinstance(value, pd.Series):
+        non_null = value.dropna()
+        return non_null.iloc[0] if not non_null.empty else None
+    return value
+
+
 def _promote_header(raw: pd.DataFrame) -> pd.DataFrame:
     if raw is None or raw.empty:
         return raw
@@ -157,10 +181,7 @@ def _promote_header(raw: pd.DataFrame) -> pd.DataFrame:
         if score > best_score:
             best_idx, best_score = i, score
     if best_score >= 1:
-        headers = []
-        for j, v in enumerate(raw.iloc[best_idx].tolist()):
-            text = str(v).strip() if pd.notna(v) else ""
-            headers.append(text or f"column_{j+1}")
+        headers = _unique_headers(raw.iloc[best_idx].tolist())
         df = raw.iloc[best_idx + 1:].copy()
         df.columns = headers
         return df.dropna(how="all")
@@ -201,7 +222,8 @@ def rows_from_dataframe(df: pd.DataFrame) -> list[SubmittedFacility]:
 
     out: list[SubmittedFacility] = []
     for _, row in df.iterrows():
-        service = str(row.get(service_col, "")).strip() if service_col is not None else ""
+        service_value = _cell(row, service_col)
+        service = str(service_value).strip() if service_value is not None else ""
         if not service or service.lower() == "nan" or _norm(service) in {_norm(x) for x in SERVICE_ALIASES}:
             continue
         # Drop obvious total/subtotal rows.
@@ -209,10 +231,10 @@ def rows_from_dataframe(df: pd.DataFrame) -> list[SubmittedFacility]:
             continue
         out.append(SubmittedFacility(
             service=service,
-            count=_num(row.get(count_col)) if count_col is not None else None,
-            land_area_m2=_num(row.get(land_col)) if land_col is not None else None,
-            gfa_m2=_num(row.get(gfa_col)) if gfa_col is not None else None,
-            level=str(row.get(level_col)).strip() if level_col is not None and pd.notna(row.get(level_col)) else None,
+            count=_num(_cell(row, count_col)) if count_col is not None else None,
+            land_area_m2=_num(_cell(row, land_col)) if land_col is not None else None,
+            gfa_m2=_num(_cell(row, gfa_col)) if gfa_col is not None else None,
+            level=(str(_cell(row, level_col)).strip() if level_col is not None and _cell(row, level_col) is not None and not pd.isna(_cell(row, level_col)) else None),
             source_row=" | ".join(str(v) for v in row.tolist() if pd.notna(v)),
         ))
     return out
@@ -378,11 +400,23 @@ def _service_similarity(required_official: str, submitted_name: str) -> float:
     return 0.0
 
 
-def match_submission(required_service: str, submitted: list[SubmittedFacility], threshold: float = 0.72):
+def match_submission(
+    required_service: str,
+    submitted: list[SubmittedFacility],
+    threshold: float = 0.68,
+    semantic_map: dict[str, tuple[str | None, float]] | None = None,
+):
+    """Match deterministically first, then use an optional AI semantic map for ambiguous bilingual labels."""
     best = None
     best_score = 0.0
+    required_clean = re.sub(r"[❶❷❸]", "", required_service).strip()
     for row in submitted:
         score = _service_similarity(required_service, row.service)
+        if semantic_map and row.service in semantic_map:
+            mapped_name, confidence = semantic_map[row.service]
+            if mapped_name == required_clean:
+                # AI is only a semantic resolver; require reasonable confidence.
+                score = max(score, min(float(confidence or 0), 0.99))
         if score > best_score:
             best_score = score
             best = row
@@ -404,14 +438,14 @@ def looks_like_facilities_table(text: str) -> bool:
     return matched >= 2
 
 
-def compare_facilities(required_result: dict[str, Any], submitted: list[SubmittedFacility]) -> dict[str, Any]:
+def compare_facilities(required_result: dict[str, Any], submitted: list[SubmittedFacility], semantic_map: dict[str, tuple[str | None, float]] | None = None) -> dict[str, Any]:
     comparisons = []
     deficit_count = 0
     ok_count = 0
 
     available = list(submitted)
     for req in required_result.get("required", []):
-        sub, score = match_submission(req["service"], available)
+        sub, score = match_submission(req["service"], available, semantic_map=semantic_map)
         if sub is not None:
             try:
                 available.remove(sub)

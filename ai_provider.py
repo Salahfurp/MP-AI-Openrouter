@@ -101,6 +101,8 @@ def _google_chat(messages: list[dict[str, str]], max_tokens: int, temperature: f
         "generationConfig": {
             "temperature": temperature,
             "maxOutputTokens": max_tokens,
+            # Keep real-time chat concise. Gemini 3.8 Flash supports low/medium/high thinking.
+            "thinkingConfig": {"thinkingLevel": os.getenv("GOOGLE_THINKING_LEVEL", "low")},
         },
     }
     headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
