@@ -514,46 +514,72 @@ def parse_uploaded_facilities(uploaded_file):
     raise ValueError("صيغة الملف غير مدعومة. استخدم Excel أو CSV أو TXT أو PDF.")
 
 
-def build_semantic_service_map(required_result, submitted_rows):
-    """Use the configured AI only to resolve ambiguous service-name equivalence.
+def _extract_json_array(raw: str):
+    """Accept clean JSON or JSON surrounded by provider chatter/thinking."""
+    if not raw:
+        return []
+    cleaned = re.sub(r"^```(?:json)?\s*", "", str(raw).strip(), flags=re.I)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        data = json.loads(cleaned)
+        return data if isinstance(data, list) else []
+    except Exception:
+        pass
+    # Providers can occasionally prepend text. Extract the outermost JSON array only.
+    a, b = cleaned.find("["), cleaned.rfind("]")
+    if a >= 0 and b > a:
+        try:
+            data = json.loads(cleaned[a:b+1])
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+    return []
 
-    Calculations and compliance remain deterministic. The model must choose only from
-    the project's already-calculated official service list or return null.
+
+def build_semantic_service_map(required_result, submitted_rows):
+    """Translate/canonicalize every submitted service before compliance comparison.
+
+    This is deliberately a bilingual terminology task. The AI may ONLY choose from
+    the official services calculated for this project. Quantities and compliance are
+    never decided by the model.
     """
     required_names = [
         re.sub(r"[❶❷❸]", "", str(x.get("service", ""))).strip()
-        for x in (required_result.get("required") or [])
-        if x.get("service")
+        for x in (required_result.get("required") or []) if x.get("service")
     ]
     submitted_names = [str(x.service).strip() for x in submitted_rows if str(x.service).strip()]
     if not required_names or not submitted_names:
         return {}
 
-    prompt = f"""You are a bilingual Arabic-English public-facilities terminology matcher.
-Your ONLY task is semantic name matching; do not calculate compliance and do not infer quantities.
-For each submitted label, choose the SAME facility concept from the exact allowed official list, even when:
-- Arabic/English differ,
-- wording/order differs,
-- common abbreviations or planning synonyms are used,
-- minor spelling errors exist.
-Do NOT match merely because two items are both schools, mosques, parks, clinics, etc. Preserve subtype distinctions.
-If no reliable equivalent exists, use null.
-Return ONLY a JSON array with keys: submitted, official, confidence. confidence is 0 to 1.
+    # Stage 1: deterministic bilingual dictionary/fuzzy matching. This works even if
+    # the external AI provider is unavailable.
+    out = {}
+    unresolved = []
+    for name in submitted_names:
+        official, confidence = best_official_service_match(name)
+        if official in required_names and confidence >= 0.70:
+            out[name] = (official, max(confidence, 0.90))
+            out[_norm(name)] = out[name]
+        else:
+            unresolved.append(name)
 
-Allowed official services:
-{json.dumps(required_names, ensure_ascii=False)}
-
-Submitted labels:
-{json.dumps(submitted_names, ensure_ascii=False)}
+    # Stage 2: AI semantic translation only for unresolved labels. It sees the entire
+    # official list so Arabic <-> English and consultant terminology can be resolved.
+    if unresolved:
+        prompt = f"""You are a professional Dubai urban-planning bilingual terminology translator and matcher.
+Translate the meaning of EACH submitted public-facility label, then map it to exactly ONE equivalent item from ALLOWED_OFFICIAL_SERVICES.
+The submitted schedule can be Arabic or English. Handle abbreviations, British/American spelling, reordered words, consultant terminology and small typos.
+Preserve subtype distinctions: primary != preparatory/middle != secondary; daily/local mosque != Friday mosque; area park != neighborhood park != sector park; clinic != health center != hospital.
+If there is no genuinely equivalent official service, set official to null.
+Return ONLY a JSON array. No prose. No markdown. No reasoning.
+Schema: [{{"submitted":"original label","arabic_translation":"Arabic meaning","official":"exact allowed Arabic service or null","confidence":0.0}}]
+ALLOWED_OFFICIAL_SERVICES={json.dumps(required_names, ensure_ascii=False)}
+SUBMITTED_LABELS={json.dumps(unresolved, ensure_ascii=False)}
 """
-    try:
-        raw = model_chat([{"role": "user", "content": prompt}], max_tokens=1800, temperature=0)
-        cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.I)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-        data = json.loads(cleaned)
-        allowed = set(required_names)
-        out = {}
-        if isinstance(data, list):
+        try:
+            raw = model_chat([{"role": "user", "content": prompt}], max_tokens=2200, temperature=0)
+            data = _extract_json_array(raw)
+            allowed = set(required_names)
             for item in data:
                 if not isinstance(item, dict):
                     continue
@@ -564,11 +590,19 @@ Submitted labels:
                     confidence = float(item.get("confidence", 0) or 0)
                 except Exception:
                     confidence = 0.0
-                if submitted and official in allowed and confidence >= 0.70:
-                    out[submitted] = (official, min(max(confidence, 0.0), 1.0))
-        return out
-    except Exception:
-        return {}
+                if submitted and official in allowed and confidence >= 0.62:
+                    out[submitted] = (official, min(max(confidence, 0.0), 0.99))
+                    out[_norm(submitted)] = out[submitted]
+        except Exception:
+            pass
+
+    # Persist the canonical Arabic translation on the parsed rows. The comparison
+    # engine therefore compares canonical concepts, not raw strings.
+    for row in submitted_rows:
+        mapped = out.get(row.service) or out.get(_norm(row.service))
+        if mapped:
+            row.canonical_service = mapped[0]
+    return out
 
 
 def build_comparison_chat_event(submitted_rows, source_label="الجدول المقدم"):
@@ -591,12 +625,14 @@ def build_comparison_chat_event(submitted_rows, source_label="الجدول ال�
     report = compare_facilities(required_result, submitted_rows, semantic_map=semantic_map)
     rows = comparison_rows(report)
     summary = report.get("summary", {})
+    matched_n = sum(1 for x in report.get("comparisons", []) if x.get("matched_submission_service"))
     deficits = [x for x in report.get("comparisons", []) if x.get("status") == "عجز"]
     if deficits:
         top = "، ".join(x.get("service", "") for x in deficits[:5])
         more = "" if len(deficits) <= 5 else f" وغيرها ({len(deficits)-5} خدمة إضافية)"
         message = (
-            f"تمت مراجعة **{source_label}** مقابل الخدمات الإلزامية المحسوبة للمشروع. "
+            f"تمت ترجمة/توحيد أسماء الخدمات في **{source_label}** عربيًا ثم مقارنتها بالخدمات الإلزامية للمشروع. "
+            f"تم التعرف على **{matched_n}** خدمة مقدمة وربطها بالمسمى الرسمي. "
             f"الاستيفاء **{summary.get('compliance_percent', 0)}%**: "
             f"**{summary.get('compliant_services', 0)} مستوفاة** و**{summary.get('deficit_services', 0)} بها عجز**.\n\n"
             f"أبرز الخدمات التي تحتاج استكمال: **{top}{more}**. "
@@ -632,7 +668,11 @@ def render_comparison_table(rows):
             return "background-color: #D1FADF; color: #027A48; font-weight: 700"
         return ""
     try:
-        st.dataframe(df.style.map(color_status, subset=["الحالة / Status"]), use_container_width=True, hide_index=True)
+        styler = df.style.map(color_status, subset=["الحالة / Status"]).set_table_styles([
+            {"selector": "th", "props": [("background-color", "#F2F4F7"), ("color", "#101828"), ("font-weight", "700"), ("border", "1px solid #D0D5DD")]},
+            {"selector": "td", "props": [("color", "#101828")]},
+        ])
+        st.dataframe(styler, use_container_width=True, hide_index=True)
     except Exception:
         st.dataframe(df, use_container_width=True, hide_index=True)
 

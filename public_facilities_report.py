@@ -169,8 +169,8 @@ def build_comparison_pdf(report: dict[str, Any], title: str = "تقرير مرا
     widths = [20, 28, 36, 36, 16, 16, 17, 22, 22, 20, 21, 21, 43]
     table = Table(data, repeatRows=1, colWidths=[w*mm for w in widths])
     ts = [
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#101828")),
-        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#E4E7EC")),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.HexColor("#101828")),
         ("FONTNAME", (0,0), (-1,0), bold),
         ("FONTNAME", (0,1), (-1,-1), font),
         ("GRID", (0,0), (-1,-1), 0.35, colors.HexColor("#D0D5DD")),

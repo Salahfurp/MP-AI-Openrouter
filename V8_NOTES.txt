@@ -1,0 +1,7 @@
+V8 fixes
+- Comparison table header changed to light background/dark text for readability.
+- Submitted Arabic/English facility names are canonicalized to official Arabic service concepts before comparison.
+- Two-stage matching: deterministic bilingual aliases/fuzzy matching, then AI semantic translation only for unresolved labels.
+- AI JSON parser tolerates provider wrapper/thinking text and extracts the JSON array safely.
+- Canonical match is persisted on each submitted row so comparison uses concepts, not literal strings.
+- Chat summary states how many submitted services were recognized/matched.

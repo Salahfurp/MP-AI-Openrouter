@@ -36,7 +36,7 @@ LEVEL_ALIASES = (
 
 # Official Arabic service name -> common English/Arabic variants seen in consultant schedules.
 SERVICE_NAME_ALIASES: dict[str, tuple[str, ...]] = {
-    "مسجد أوقات": ("daily mosque", "local mosque", "neighborhood mosque", "neighbourhood mosque", "prayer mosque", "masjid", "mosque"),
+    "مسجد أوقات": ("daily mosque", "local mosque", "neighborhood mosque", "neighbourhood mosque", "local masjid", "community mosque", "prayer mosque", "masjid", "mosque daily prayer"),
     "محلات تجارية": ("retail shops", "shops", "local shops", "commercial shops", "convenience retail", "retail"),
     "مجمع صناديق بريد": ("post box cluster", "po box cluster", "p.o. box cluster", "mailbox cluster", "post boxes"),
     "ساحة عامة": ("public plaza", "public square", "community plaza", "civic plaza"),
@@ -46,14 +46,14 @@ SERVICE_NAME_ALIASES: dict[str, tuple[str, ...]] = {
     "مركز تجاري": ("commercial center", "commercial centre", "retail center", "retail centre", "shopping center", "shopping centre"),
     "حضانة أطفال": ("nursery", "daycare", "day care", "childcare", "child care", "nursery school"),
     "روضة أطفال": ("kindergarten", "kg", "kg school", "pre school", "preschool"),
-    "مدرسة ابتدائي": ("primary school", "elementary school", "primary education"),
+    "مدرسة ابتدائي": ("primary school", "elementary school", "primary education", "primary education school", "primary boys school", "primary girls school"),
     "عيادة خاصة تخصص عام": ("private general clinic", "general clinic", "private clinic general", "general medical clinic"),
     "عيادة خاصة تخصصية": ("private specialist clinic", "private specialized clinic", "specialist clinic", "specialized clinic"),
     "مركز طبي خاص": ("private medical center", "private medical centre", "medical center", "medical centre"),
     "ملاعب رياضية": ("sports fields", "sports field", "sports facilities", "sports courts", "play fields", "playing fields"),
     "حديقة منطقة": ("area park", "community park", "district park", "area garden"),
-    "مدرسة إعدادي": ("preparatory school", "middle school", "intermediate school", "prep school"),
-    "مدرسة ثانوي": ("secondary school", "high school", "senior school"),
+    "مدرسة إعدادي": ("preparatory school", "middle school", "intermediate school", "prep school", "preparatory education school", "middle education school"),
+    "مدرسة ثانوي": ("secondary school", "high school", "senior school", "secondary education school", "secondary education", "senior secondary school"),
     "مركز طبي جراحي خاص": ("private surgical medical center", "private surgical medical centre", "private surgical center", "surgical medical center"),
     "مكتب بريد": ("post office", "postal office"),
     "مركز صحي حكومي": ("government health center", "government health centre", "public health center", "public health centre", "health center", "health centre"),
@@ -80,6 +80,7 @@ class SubmittedFacility:
     gfa_m2: float | None = None
     level: str | None = None
     source_row: str | None = None
+    canonical_service: str | None = None
 
 
 def _norm(s: Any) -> str:
@@ -411,9 +412,16 @@ def match_submission(
     best_score = 0.0
     required_clean = re.sub(r"[❶❷❸]", "", required_service).strip()
     for row in submitted:
-        score = _service_similarity(required_service, row.service)
-        if semantic_map and row.service in semantic_map:
-            mapped_name, confidence = semantic_map[row.service]
+        # Prefer the canonical bilingual translation resolved before comparison.
+        if row.canonical_service:
+            score = 0.995 if _norm(row.canonical_service) == _norm(required_clean) else 0.0
+        else:
+            score = _service_similarity(required_service, row.service)
+        sem = None
+        if semantic_map:
+            sem = semantic_map.get(row.service) or semantic_map.get(_norm(row.service))
+        if sem:
+            mapped_name, confidence = sem
             if mapped_name == required_clean:
                 # AI is only a semantic resolver; require reasonable confidence.
                 score = max(score, min(float(confidence or 0), 0.99))
