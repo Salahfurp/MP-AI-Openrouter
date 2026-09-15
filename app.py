@@ -13,7 +13,7 @@ from ai_provider import ai_chat, provider_label
 from public_facilities_chat import new_flow_state, process_public_facilities_turn, detect_public_facilities_intent
 from public_facilities_comparison import (
     SubmittedFacility, compare_facilities, comparison_rows, parse_csv_or_text_table,
-    parse_excel_bytes, parse_pdf_bytes, looks_like_facilities_table,
+    parse_excel_bytes, parse_pdf_bytes, looks_like_facilities_table, best_official_service_match,
 )
 from public_facilities_report import build_comparison_pdf
 
