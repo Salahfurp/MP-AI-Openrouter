@@ -1,7 +1,0 @@
-V10 Agent Architecture
-- AI-first bilingual semantic intent orchestration (Arabic/English paraphrases).
-- Users can switch between UPPG, facilities calculation, facilities review, and general planning assistance at any time.
-- UPPG is a knowledge tool, not the assistant's entire personality.
-- Public-facilities math/compliance remains deterministic; AI only understands intent/language and assists semantic matching.
-- General assistant route provides suggestions without inventing official requirements.
-- Google Gemini 3.8 Flash is preferred when AI_PROVIDER=google; OpenRouter remains fallback.
