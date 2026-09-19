@@ -1,0 +1,22 @@
+Master Plan AI Assistant V10.3 — Stabilization Release
+
+Fixes:
+- Removed app.py dependency on private _norm helper (root cause of latest NameError).
+- Added local _service_key() for semantic-map lookup keys.
+- Semantic AI matching is now fail-safe: provider/mapping failure cannot crash deterministic compliance comparison.
+- Preserved bilingual deterministic matching and all original public-facilities modules.
+- Added SELF_TEST.py for offline regression smoke tests.
+
+Validation performed before packaging:
+1) Python compile check on every .py file: PASS.
+2) Static global-name audit using Python symtable: no unresolved application globals (except built-in runtime __file__). PASS.
+3) Public-facilities engine: 850,000 m² / 25,000 population returned 18 required services. PASS.
+4) Bilingual canonical matching:
+   Secondary Education School -> مدرسة ثانوي: PASS
+   Friday Mosque -> مسجد جمعة: PASS
+   Neighbourhood Park -> حديقة حي: PASS
+5) Synthetic English Excel with title/header rows parsed successfully and matched to Arabic official services: PASS.
+6) Deterministic comparison completed without AI provider: PASS.
+
+Deployment:
+Upload/replace the complete repository contents. Keep Render environment variables outside GitHub.
