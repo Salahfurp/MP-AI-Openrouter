@@ -1,7 +1,0 @@
-V10.1 HOTFIX
-- Removed all Demo / RAG mode controls from the UI.
-- Removed rigid quick-category buttons from the main UI.
-- Render blueprint now uses Google/Gemini environment variables, not legacy OpenAI/OpenRouter defaults.
-- UPPG route is now explicitly reserved for official guideline facts only.
-- Public Facilities requests are explicitly routed to facilities tools, not UPPG retrieval.
-- Package is provided flat at ZIP root so app.py is replaced correctly when deploying.
